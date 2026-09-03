@@ -39,9 +39,7 @@ git status
 Create `stms.yml` at the repository root from the packaged example:
 
 ```shell
-curl -fsSL \
-  https://raw.githubusercontent.com/craverath/stms2-/main/src/stms/stms.example.yml \
-  -o stms.yml
+stms init
 ```
 
 Edit `stms.yml` before the first run. For the simplest setup, select `codex` for
@@ -58,6 +56,18 @@ stms resume
 stms resume <run-id>
 ```
 
+Update the installed command with:
+
+```shell
+stms update
+```
+
+Remove the installed command without changing any repository files with:
+
+```shell
+stms uninstall
+```
+
 To use Claude Code for one or more roles, install STMS with its optional SDK and
 install/authenticate Claude Code before selecting `harness: claude`:
 
@@ -68,8 +78,8 @@ claude
 claude auth status
 ```
 
-Codex and Claude are supported; Pi is experimental. STMS deliberately does not
-create `stms.yml`, install project dependencies, authenticate accounts, push,
+Codex and Claude are supported; Pi is experimental. STMS does not overwrite an
+existing `stms.yml`, install project dependencies, authenticate accounts, push,
 deploy, or weaken sandbox policy. A missing harness, unavailable model/effort,
 or incompatible sandbox stops preflight with a corrective action.
 

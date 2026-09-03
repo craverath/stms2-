@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+import shutil
+import subprocess
 
 import typer
 
+from stms.application.configuration import configuration_example
 from stms.composition import compose
 from stms.application.orchestrator import Orchestrator, RunContext
 from stms.domain.errors import ConfigurationError, InfrastructureError, StmsError
@@ -13,6 +16,51 @@ from stms.domain.models import RunState
 from stms.terminal import Terminal
 
 app = typer.Typer(help="STMS local development workflow orchestrator.", no_args_is_help=True)
+
+
+@app.command()
+def init() -> None:
+    """Create a project configuration from the packaged example."""
+    config_path = Path.cwd() / "stms.yml"
+    try:
+        example = configuration_example()
+        with config_path.open("x", encoding="utf-8") as config_file:
+            config_file.write(example)
+    except FileExistsError:
+        typer.echo("stms.yml already exists; it was not changed.", err=True)
+        raise typer.Exit(code=2)
+    except (ConfigurationError, OSError) as error:
+        typer.echo(f"Could not create stms.yml: {error}", err=True)
+        raise typer.Exit(code=2) from error
+    typer.echo(f"Created {config_path}")
+
+
+@app.command()
+def update() -> None:
+    """Update the installed STMS tool using uv."""
+    uv_executable = shutil.which("uv")
+    if uv_executable is None:
+        typer.echo("Could not update STMS: uv is not installed or is not on PATH.", err=True)
+        raise typer.Exit(code=2)
+
+    result = subprocess.run([uv_executable, "tool", "upgrade", "stms"], check=False)
+    if result.returncode:
+        typer.echo("Could not update STMS; see the uv output above.", err=True)
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def uninstall() -> None:
+    """Uninstall STMS using uv without changing project files."""
+    uv_executable = shutil.which("uv")
+    if uv_executable is None:
+        typer.echo("Could not uninstall STMS: uv is not installed or is not on PATH.", err=True)
+        raise typer.Exit(code=2)
+
+    result = subprocess.run([uv_executable, "tool", "uninstall", "stms"], check=False)
+    if result.returncode:
+        typer.echo("Could not uninstall STMS; see the uv output above.", err=True)
+        raise typer.Exit(code=1)
 
 
 @app.command()

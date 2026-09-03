@@ -32,7 +32,7 @@ def configuration_example() -> str:
 def load_runtime_config(repository: Path) -> RuntimeConfig:
     config_path = repository / "stms.yml"
     if not config_path.is_file():
-        raise ConfigurationError("Missing required stms.yml.", f"Create it manually using this example:\n{configuration_example()}")
+        raise ConfigurationError("Missing required stms.yml.", f"Run 'stms init', or create it using this example:\n{configuration_example()}")
     try:
         payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     except yaml.YAMLError as error:
