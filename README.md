@@ -6,9 +6,9 @@ and the final human merge gate auditable without sending telemetry.
 
 ## Status
 
-STMS 0.1.0 is ready for local evaluation from this Git repository. This project
-is not published on PyPI; the package named `stms` there is unrelated. Install
-from the Git URL below. Real-provider conformance checks are still manual.
+STMS is ready for local evaluation from this Git repository. This project is not
+published on PyPI; the package named `stms` there is unrelated. Install from the
+Git URL below. Real-provider conformance checks are still manual.
 
 ## Quick start
 
@@ -63,6 +63,24 @@ stms abort <run-id> --yes
 stms clean --dry-run
 stms --version
 ```
+
+## Versioning
+
+The package version is generated automatically from Git by `hatch-vcs`. A tag
+such as `v0.2.0` produces version `0.2.0`; later commits receive a PEP 440
+development version containing the commit distance and hash. There is no version
+file to update manually.
+
+To create a release version, tag the release commit and build from that exact
+commit:
+
+```shell
+git tag v0.2.0
+uv build
+```
+
+Use semantic version tags (`vMAJOR.MINOR.PATCH`). The generated version is shown
+by `stms --version` and embedded in both wheel and source distributions.
 
 Update the installed command with:
 

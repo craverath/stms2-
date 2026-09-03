@@ -1270,7 +1270,6 @@ wheels = [
 
 [[package]]
 name = "stms"
-version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "langgraph" },
@@ -1304,7 +1303,7 @@ requires-dist = [
     { name = "rich", specifier = ">=13,<15" },
     { name = "typer", specifier = ">=0.15,<1" },
 ]
-provides-extras = ["dev", "claude"]
+provides-extras = ["claude", "dev"]
 
 [[package]]
 name = "tenacity"

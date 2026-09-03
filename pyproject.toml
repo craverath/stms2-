@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling>=1.27", "hatch-vcs>=0.4,<1"]
 build-backend = "hatchling.build"
 
 [project]
 name = "stms"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Local, deterministic orchestration for agent-assisted development"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -34,3 +34,9 @@ asyncio_mode = "auto"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/stms"]
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/stms/_version.py"

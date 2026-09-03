@@ -7,6 +7,7 @@ import sqlite3
 
 from typer.testing import CliRunner
 
+from stms import __version__
 from stms.adapters.persistence.sqlite_store import SQLiteCheckpointStore, resumable_run_exists
 from stms.cli import app
 from stms.domain.models import RunMetadata, RunState, WorkflowSnapshot
@@ -38,7 +39,7 @@ def test_version_and_empty_queries_do_not_create_stms(tmp_path: Path, monkeypatc
     version = runner.invoke(app, ["--version"])
     runs = runner.invoke(app, ["runs"])
 
-    assert version.exit_code == 0 and version.output == "stms 0.1.0\n"
+    assert version.exit_code == 0 and version.output == f"stms {__version__}\n"
     assert runs.exit_code == 0 and "No STMS runs" in runs.output
     assert not (tmp_path / ".stms").exists()
 
