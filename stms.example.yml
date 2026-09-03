@@ -1,0 +1,25 @@
+version: 1
+agents:
+  planner: { harness: codex, model: example-model, effort: high }
+  implementer: { harness: claude, model: example-model, effort: high }
+  reviewer: { harness: codex, model: example-model, effort: high }
+workflow:
+  max_parallel_tasks: 2
+  infrastructure_retries: 2
+  implementation_retries: 3
+  structured_output_retries: 2
+tests:
+  timeout_seconds: 900
+  commands: []
+review:
+  severities:
+    high: Core requirement, security, data loss, broken suite or unusable code
+    medium: Relevant behavior, important case or significant maintainability issue
+    low: Small improvement without impact on core behavior
+  blocking: { round_1: [high, medium, low], round_2: [high, medium], round_3: [high], round_4: [] }
+  escalate: { round_4: [high] }
+security:
+  sandbox: srt
+  allow_native_fallback: false
+  planner_web: true
+  test_network: false

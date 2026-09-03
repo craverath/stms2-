@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stms"
+version = "0.1.0"
+description = "Local, deterministic orchestration for agent-assisted development"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "STMS contributors" }]
+dependencies = [
+  "pydantic>=2.10,<3",
+  "PyYAML>=6.0,<7",
+  "typer>=0.15,<1",
+  "rich>=13,<15",
+  "prompt-toolkit>=3.0,<4",
+  "langgraph>=0.2,<1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9", "pytest-asyncio>=0.24,<1"]
+
+[project.scripts]
+stms = "stms.cli:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+asyncio_mode = "auto"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stms"]
