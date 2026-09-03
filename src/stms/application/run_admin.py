@@ -231,9 +231,8 @@ def abort_run(repository: Path, run_id: str) -> tuple[WorkflowSnapshot, bool]:
         snapshot = transition(current.snapshot, AllowedEvent.ABORT).model_copy(
             update={"updated_at": datetime.now(timezone.utc)}
         )
-        store.save_snapshot(snapshot)
-        store.record_operation(
-            current.run_id,
+        store.save_snapshot_and_confirm_operation(
+            snapshot,
             ExternalOperation(
                 id=operation_id,
                 kind="abort",

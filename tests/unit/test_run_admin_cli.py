@@ -141,6 +141,39 @@ def test_abort_refuses_live_process_and_handles_replanning(tmp_path: Path, monke
     assert repeated.exit_code == 0 and "already FAILED" in repeated.output
 
 
+def test_abort_retries_after_atomic_confirmation_failure(tmp_path: Path, monkeypatch) -> None:
+    run = _run(tmp_path, "recoverable", RunState.PAUSED)
+    database = run / "checkpoint.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("""
+            CREATE TRIGGER fail_abort_confirmation
+            BEFORE UPDATE OF status ON operations
+            WHEN NEW.status = 'confirmed'
+            BEGIN
+                SELECT RAISE(ABORT, 'simulated confirmation failure');
+            END
+        """)
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    failed = runner.invoke(app, ["abort", "recoverable", "--yes"])
+
+    store = SQLiteCheckpointStore(database)
+    assert failed.exit_code == 1
+    assert store.latest_snapshot("recoverable").state == RunState.PAUSED
+    assert store.operation("recoverable", "admin-abort-2").status.value == "pending"
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TRIGGER fail_abort_confirmation")
+
+    retried = runner.invoke(app, ["abort", "recoverable", "--yes"])
+
+    assert retried.exit_code == 0
+    assert store.latest_snapshot("recoverable").state == RunState.FAILED
+    assert store.operation("recoverable", "admin-abort-2").status.value == "confirmed"
+    assert '"event_type": "abort"' in (run / "events.jsonl").read_text(encoding="utf-8")
+
+
 def test_clean_dry_run_confirmation_and_safe_targets(tmp_path: Path, monkeypatch) -> None:
     terminal = _run(tmp_path, "terminal", RunState.COMPLETED)
     active = _run(tmp_path, "active", RunState.IMPLEMENTING)

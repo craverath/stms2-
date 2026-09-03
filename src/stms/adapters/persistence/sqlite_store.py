@@ -177,6 +177,41 @@ class SQLiteCheckpointStore:
             connection.execute("INSERT INTO snapshots(run_id, state, snapshot_json, created_at) VALUES (?, ?, ?, ?)", (snapshot.metadata.run_id, snapshot.state.value, payload, _now()))
             connection.execute("COMMIT")
 
+    def save_snapshot_and_confirm_operation(
+        self,
+        snapshot: WorkflowSnapshot,
+        operation: ExternalOperation,
+    ) -> None:
+        """Persist a snapshot and its completed operation atomically."""
+        if operation.status != OperationStatus.CONFIRMED:
+            raise ValueError("operation must be confirmed")
+        payload = snapshot.model_dump_json()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "INSERT INTO snapshots(run_id, state, snapshot_json, created_at) VALUES (?, ?, ?, ?)",
+                    (snapshot.metadata.run_id, snapshot.state.value, payload, _now()),
+                )
+                connection.execute(
+                    "INSERT INTO operations(run_id, operation_id, kind, status, result_reference, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(run_id, operation_id) DO UPDATE SET "
+                    "status=excluded.status, result_reference=excluded.result_reference, updated_at=excluded.updated_at",
+                    (
+                        snapshot.metadata.run_id,
+                        operation.id,
+                        operation.kind,
+                        operation.status.value,
+                        operation.result_reference,
+                        _now(),
+                    ),
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
     def latest_snapshot(self, run_id: str) -> WorkflowSnapshot | None:
         with self._connection() as connection:
             row = connection.execute("SELECT snapshot_json FROM snapshots WHERE run_id = ? ORDER BY sequence DESC LIMIT 1", (run_id,)).fetchone()
