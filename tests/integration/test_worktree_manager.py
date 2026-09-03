@@ -1,7 +1,7 @@
 from pathlib import Path
 import subprocess
 
-from stms.deterministic.worktree_manager import GitWorktreeManager
+from stms.deterministic.worktree_manager import GitWorktreeManager, default_worktrees_root
 
 
 def git(repo: Path, *args: str) -> str:
@@ -43,6 +43,24 @@ def test_task_reconciliation_rejects_same_subject_with_different_commit(tmp_path
     metadata = manager.task_commit_metadata("one")
     (task / "feature.txt").write_text("second\n"); git(task, "add", "feature.txt"); git(task, "commit", "--amend", "-m", "stms task one")
     assert manager.reconciled_task_commit("one", metadata) is None
+
+
+def test_worktrees_live_outside_the_repository_and_keep_git_status_clean(tmp_path: Path) -> None:
+    repo = repository(tmp_path); base = git(repo, "rev-parse", "HEAD")
+    manager = GitWorktreeManager(repo, worktrees_root=tmp_path / "external-worktrees")
+    integration = manager.create_integration("run", base)
+    task = manager.create_task("run", "one")
+    assert repo not in integration.parents and repo not in task.parents
+    assert git(repo, "status", "--porcelain") == ""
+
+
+def test_default_worktrees_root_is_deterministic_per_repository_and_outside_it(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    first = GitWorktreeManager(repo).worktrees_root
+    second = GitWorktreeManager(repo).worktrees_root
+    assert first == second
+    assert repo.resolve() not in first.parents and first != repo.resolve()
+    assert first == default_worktrees_root(repo)
 
 
 def test_reconciles_commit_and_cherry_pick_after_crash_before_checkpoint(tmp_path: Path) -> None:

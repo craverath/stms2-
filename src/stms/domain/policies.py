@@ -1,18 +1,30 @@
 """Deterministic workflow policy helpers."""
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from .models import Severity
 
-_BLOCKING = {1: {Severity.HIGH, Severity.MEDIUM, Severity.LOW}, 2: {Severity.HIGH, Severity.MEDIUM}, 3: {Severity.HIGH}, 4: set()}
+
+def blocking_findings(
+    round_number: int,
+    severities: list[Severity],
+    policy: Mapping[str, list[Severity]],
+) -> list[Severity]:
+    key = f"round_{round_number}"
+    if key not in policy:
+        raise ValueError("review round must be configured between 1 and 4")
+    blocking = set(policy[key])
+    return [severity for severity in severities if severity in blocking]
 
 
-def blocking_findings(round_number: int, severities: list[Severity]) -> list[Severity]:
-    if round_number not in _BLOCKING: raise ValueError("review round must be between 1 and 4")
-    return [severity for severity in severities if severity in _BLOCKING[round_number]]
-
-
-def escalates_to_human(round_number: int, severities: list[Severity]) -> bool:
-    return round_number == 4 and Severity.HIGH in severities
+def escalates_to_human(
+    round_number: int,
+    severities: list[Severity],
+    policy: Mapping[str, list[Severity]],
+) -> bool:
+    escalated = set(policy.get(f"round_{round_number}", []))
+    return any(severity in escalated for severity in severities)
 
 
 def retry_exhausted(attempts_already_used: int, allowed_retries: int) -> bool:

@@ -17,9 +17,10 @@ Return only the ImplementerOutput JSON schema."""
 
 
 class ImplementerAgent:
-    def __init__(self, harness: AgentHarness, prompt_provider: PromptProvider | None = None) -> None:
+    def __init__(self, harness: AgentHarness, prompt_provider: PromptProvider | None = None, *, structured_output_retries: int = 2) -> None:
         self._harness = harness
         self._prompt = resolve_prompt(AgentRole.IMPLEMENTER.value, DEFAULT_PROMPT, prompt_provider)
+        self._structured_output_retries = structured_output_retries
 
     async def implement(self, request: HarnessRequest, task: PlanTask, plan: ApprovedPlan, context: str = "") -> ImplementerOutput:
         if task.id not in {candidate.id for candidate in plan.tasks}:
@@ -29,4 +30,4 @@ class ImplementerAgent:
             f"{self._prompt}\n\nAssigned task:\n{task.model_dump_json()}\n\n"
             f"Approved frozen plan:\n{frozen}\n\nRelevant context:\n{context}\n\nRequest:\n{request.prompt}"
         )})
-        return await request_structured(self._harness, enriched, role=AgentRole.IMPLEMENTER, output_type=ImplementerOutput)
+        return await request_structured(self._harness, enriched, role=AgentRole.IMPLEMENTER, output_type=ImplementerOutput, structured_output_retries=self._structured_output_retries)

@@ -8,9 +8,10 @@ import subprocess
 import pytest
 
 from stms.adapters.harnesses.base import ProviderResponse
-from stms.adapters.harnesses.fake import FakeHarness
+from stms.adapters.harnesses.fake import FakeHarness, FakeResponse
 from stms.adapters.sandbox.srt import FakeSandboxRuntime
 from stms.application.orchestrator import Orchestrator
+from stms.domain.errors import InfrastructureError
 from stms.domain.models import AgentRole, HarnessRequest, RunState
 
 
@@ -102,3 +103,48 @@ async def test_full_suite_failure_opens_integration_correction_then_resume(tmp_p
     assert await orchestrator.review(resumed)
     orchestrator.final_decision(resumed, "approve")
     assert resumed.workflow.snapshot.state == RunState.COMPLETED and (repo / "fix").exists()
+
+
+@pytest.mark.asyncio
+async def test_review_discards_non_blocking_findings_from_correction_context(tmp_path: Path) -> None:
+    class LowReviewHarness(_WritingHarness):
+        async def _next(self, request: HarnessRequest) -> ProviderResponse:
+            if request.role is AgentRole.REVIEWER:
+                self.requests.append(request)
+                return ProviderResponse("reviewer", {"findings": [{
+                    "id": "low", "severity": "low", "evidence": "minor", "suggested_fix": "polish",
+                }]})
+            return await super()._next(request)
+
+    repo = _repository(tmp_path)
+    (repo / "stms.yml").write_text((repo / "stms.yml").read_text().replace("round_1: [high, medium, low]", "round_1: [high]"))
+    harness = LowReviewHarness(_plan(["true"]))
+    orchestrator = Orchestrator(repo, harnesses={"fake": harness}, sandbox=FakeSandboxRuntime(tmp_path / "policies"))
+    context = orchestrator.start("feature", run_id="nonblocking")
+    await orchestrator.plan_turn(context, "feature"); orchestrator.approve_plan(context)
+    assert await orchestrator.execute_plan(context)
+    assert await orchestrator.review(context)
+    assert context.correction_context == ""
+    assert (context.workflow.artifacts.root / "correction.md").read_text() == ""
+
+
+@pytest.mark.asyncio
+async def test_infrastructure_retry_uses_progressive_injected_backoff(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    harness = FakeHarness([
+        InfrastructureError("provider unavailable", "retry"),
+        FakeResponse(_plan(["true"])),
+    ])
+    delays = []
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    orchestrator = Orchestrator(
+        repo, harnesses={"fake": harness}, sandbox=FakeSandboxRuntime(tmp_path / "policies"),
+        sleep=sleep, infrastructure_backoff_seconds=0.25,
+    )
+    context = orchestrator.start("feature", run_id="infra")
+    await orchestrator.plan_turn(context, "feature")
+    assert delays == [0.25]
+    assert context.workflow.snapshot.review_round is None

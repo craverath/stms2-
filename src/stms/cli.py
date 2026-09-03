@@ -50,7 +50,7 @@ def resume(run_id: str | None = typer.Argument(None, help="Optional run ID; newe
 
 async def _start_interactive(repository: Path, request: str) -> int:
     terminal = Terminal()
-    orchestrator = compose(repository)
+    orchestrator = compose(repository, event_renderer=terminal)
     context = orchestrator.start(request)
     message = request
     turns_without_plan = 0
@@ -92,7 +92,7 @@ async def _start_interactive(repository: Path, request: str) -> int:
 
 async def _resume_interactive(repository: Path, run_id: str | None) -> int:
     terminal = Terminal()
-    orchestrator = compose(repository)
+    orchestrator = compose(repository, event_renderer=terminal)
     context = orchestrator.resume(run_id)
     await terminal.write(f"Resumed {context.workflow.snapshot.metadata.run_id}: {context.workflow.snapshot.state}")
     if context.workflow.snapshot.state == RunState.PAUSED:

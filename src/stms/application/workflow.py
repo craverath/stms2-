@@ -7,25 +7,28 @@ from uuid import uuid4
 from hashlib import sha256
 from typing import Callable, TypeVar
 
-from stms.adapters.persistence.artifact_store import LocalArtifactStore
+from stms.adapters.persistence.artifact_store import JsonlEventSink, LocalArtifactStore
 from stms.adapters.persistence.langgraph_engine import LocalWorkflowEngine
 from stms.domain.events import NormalizedEvent
 from stms.domain.models import AllowedEvent, RunMetadata, RunState, WorkflowSnapshot
+from stms.domain.ports import EventRenderer, EventSink
 from stms.domain.states import allowed_events, transition
 
 
 class RunWorkflow:
     """Own state changes and their readable projections for one persisted run."""
 
-    def __init__(self, engine: LocalWorkflowEngine, artifacts: LocalArtifactStore, snapshot: WorkflowSnapshot) -> None:
+    def __init__(self, engine: LocalWorkflowEngine, artifacts: LocalArtifactStore, snapshot: WorkflowSnapshot, *, event_sink: EventSink | None = None, event_renderer: EventRenderer | None = None) -> None:
         self.engine = engine
         self.artifacts = artifacts
         self.snapshot = snapshot
+        self.event_sink = event_sink or JsonlEventSink(artifacts)
+        self.event_renderer = event_renderer
 
     @classmethod
-    def new(cls, engine: LocalWorkflowEngine, artifacts: LocalArtifactStore, metadata: RunMetadata) -> "RunWorkflow":
+    def new(cls, engine: LocalWorkflowEngine, artifacts: LocalArtifactStore, metadata: RunMetadata, *, event_sink: EventSink | None = None, event_renderer: EventRenderer | None = None) -> "RunWorkflow":
         snapshot = WorkflowSnapshot(metadata=metadata, allowed_events=allowed_events(RunState.INTERVIEWING))
-        workflow = cls(engine, artifacts, snapshot)
+        workflow = cls(engine, artifacts, snapshot, event_sink=event_sink, event_renderer=event_renderer)
         workflow._persist("run-created")
         return workflow
 
@@ -91,9 +94,22 @@ class RunWorkflow:
     def abort(self) -> WorkflowSnapshot:
         return self.apply(AllowedEvent.ABORT, result="user_aborted")
 
+    def observe(self, event_type: str, *, task_id: str | None = None, result: str | None = None, duration_seconds: float | None = None) -> None:
+        self._emit(NormalizedEvent(
+            run_id=self.snapshot.metadata.run_id,
+            event_type=event_type,
+            phase=self.snapshot.phase,
+            state=self.snapshot.state,
+            task_id=task_id,
+            attempt=self.snapshot.attempt,
+            review_round=self.snapshot.review_round,
+            duration_seconds=duration_seconds,
+            result=result,
+        ))
+
     def _persist(self, event_type: str, *, result: str | None = None) -> None:
         self.artifacts.write_json("state.json", self.snapshot.model_dump(mode="json"))
-        self.artifacts.append_event(NormalizedEvent(
+        self._emit(NormalizedEvent(
             run_id=self.snapshot.metadata.run_id,
             event_type=event_type,
             phase=self.snapshot.phase,
@@ -103,3 +119,15 @@ class RunWorkflow:
             review_round=self.snapshot.review_round,
             result=result,
         ))
+
+    def _emit(self, event: NormalizedEvent) -> None:
+        try:
+            self.event_sink.emit(event)
+        except Exception:
+            # Observability must never become a workflow transition input.
+            pass
+        if self.event_renderer is not None:
+            try:
+                self.event_renderer.render(event)
+            except Exception:
+                pass

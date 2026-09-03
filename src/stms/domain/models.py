@@ -226,6 +226,20 @@ class ReviewConfig(StrictModel):
     blocking: dict[str, list[Severity]]
     escalate: dict[str, list[Severity]]
 
+    @model_validator(mode="after")
+    def validate_review_policy(self) -> "ReviewConfig":
+        expected_severities = set(Severity)
+        if set(self.severities) != expected_severities:
+            raise ValueError("review.severities must define high, medium, and low")
+        if any(not description.strip() for description in self.severities.values()):
+            raise ValueError("review severity descriptions must be non-empty")
+        valid_rounds = {f"round_{number}" for number in range(1, 5)}
+        if set(self.blocking) != valid_rounds:
+            raise ValueError("review.blocking must define exactly round_1 through round_4")
+        if not set(self.escalate) <= valid_rounds:
+            raise ValueError("review.escalate contains an unknown review round")
+        return self
+
 
 class SecurityConfig(StrictModel):
     sandbox: str = Field(default="srt", min_length=1)
@@ -372,6 +386,8 @@ class WorkflowSnapshot(StrictModel):
     task_id: TaskId | None = None
     review_round: ReviewRound | None = None
     attempt: int = Field(default=0, ge=0)
+    implementation_attempts: dict[str, int] = Field(default_factory=dict)
+    correction_stage: str | None = None
     allowed_events: list[AllowedEvent] = Field(default_factory=list)
     last_transition: str | None = None
     resume_state: RunState | None = None

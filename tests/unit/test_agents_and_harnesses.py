@@ -5,7 +5,7 @@ import pytest
 from stms.adapters.harnesses.fake import FakeHarness, FakeResponse
 from stms.agents.implementer import ImplementerAgent
 from stms.agents.planner import PlannerAgent
-from stms.agents.prompts import FilePromptProvider
+from stms.agents.prompts import FilePromptProvider, prompt_digest
 from stms.agents.reviewer import ReviewerAgent
 from stms.domain.errors import SessionLostError, StructuredOutputError
 from stms.domain.models import AcceptanceCriterion, AgentRole, ApprovedPlan, HarnessRequest, PlanTask, TestCommand
@@ -22,6 +22,15 @@ async def test_planner_repairs_invalid_output_exactly_twice_then_pauses() -> Non
         await PlannerAgent(harness).respond(request())
     assert error.value.attempts == 2
     assert len(harness.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_structured_output_repair_count_is_configurable() -> None:
+    harness = FakeHarness([FakeResponse({}), FakeResponse({})])
+    with pytest.raises(StructuredOutputError) as error:
+        await PlannerAgent(harness, structured_output_retries=1).respond(request())
+    assert error.value.attempts == 1
+    assert len(harness.requests) == 2
 
 
 @pytest.mark.asyncio
@@ -56,3 +65,22 @@ def test_file_prompt_override_stays_inside_repository(tmp_path: Path) -> None:
     assert FilePromptProvider(tmp_path, {"planner": ".stms/planner.md"}).prompt_for("planner") == "custom"
     with pytest.raises(Exception):
         FilePromptProvider(tmp_path, {"planner": "../outside.md"}).prompt_for("planner")
+
+
+def test_effective_prompt_digest_covers_defaults_and_file_contents(tmp_path: Path) -> None:
+    custom = tmp_path / "reviewer.md"; custom.write_text("custom reviewer")
+    provider = FilePromptProvider(
+        tmp_path,
+        {"planner": None, "implementer": None, "reviewer": "reviewer.md"},
+        {"planner": "p", "implementer": "i", "reviewer": "r"},
+    )
+    first = prompt_digest(provider)
+    custom.write_text("changed reviewer")
+    assert prompt_digest(provider) != first
+
+
+@pytest.mark.asyncio
+async def test_reviewer_receives_configured_severity_descriptions() -> None:
+    harness = FakeHarness([FakeResponse({"findings": []})])
+    await ReviewerAgent(harness, severity_descriptions={"high": "custom high"}).review(request(AgentRole.REVIEWER))
+    assert "custom high" in harness.requests[0].prompt

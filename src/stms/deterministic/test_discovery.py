@@ -7,16 +7,28 @@ from pathlib import Path
 from stms.domain.models import TestCommand
 
 
-def discover_test_commands(repository: Path, explicit: list[TestCommand], proposed: list[TestCommand] | None = None) -> list[TestCommand]:
+def discover_test_commands(
+    repository: Path,
+    explicit: list[TestCommand],
+    proposed: list[TestCommand] | None = None,
+    *,
+    default_timeout_seconds: int = 900,
+) -> list[TestCommand]:
     if explicit:
-        return explicit
-    documented = _documented_commands(repository)
-    if documented:
-        return documented
-    manifest = _manifest_commands(repository)
-    if manifest:
-        return manifest
-    return list(proposed or [])
+        selected = explicit
+    else:
+        documented = _documented_commands(repository)
+        if documented:
+            selected = documented
+        else:
+            manifest = _manifest_commands(repository)
+            selected = manifest if manifest else list(proposed or [])
+    return [
+        command if "timeout_seconds" in command.model_fields_set else command.model_copy(
+            update={"timeout_seconds": default_timeout_seconds}
+        )
+        for command in selected
+    ]
 
 
 def _documented_commands(repository: Path) -> list[TestCommand]:

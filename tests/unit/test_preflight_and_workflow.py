@@ -6,7 +6,7 @@ import pytest
 from stms.adapters.harnesses.fake import FakeHarness, FakeResponse
 from stms.application.orchestrator import Orchestrator
 from stms.application.preflight import PreflightService
-from stms.domain.errors import InfrastructureError
+from stms.domain.errors import CompatibilityError, InfrastructureError, StructuredOutputError
 from stms.domain.models import Capability, RunState
 from stms.domain.models import AcceptanceCriterion, ImplementerOutput, PlanTask
 
@@ -100,6 +100,66 @@ async def test_safe_pause_is_restored_by_resume_without_replaying_work(tmp_path:
     context.workflow.pause("keyboard_interrupt")
     restored = Orchestrator(repo, harnesses={"fake": FakeHarness([])}, sandbox=sandbox).resume("resume-run")
     assert restored.workflow.snapshot.state == RunState.INTERVIEWING
+
+
+def test_prompt_digest_is_persisted_and_checked_on_resume(tmp_path: Path) -> None:
+    repo = _repository(tmp_path); sandbox = _Sandbox()
+    prompt = repo / "planner.md"; prompt.write_text("first")
+    config = (repo / "stms.yml").read_text().replace(
+        "planner: { harness: fake, model: model, effort: high }",
+        "planner: { harness: fake, model: model, effort: high, prompt: planner.md }",
+    )
+    (repo / "stms.yml").write_text(config)
+    orchestrator = Orchestrator(repo, harnesses={"fake": FakeHarness([])}, sandbox=sandbox)
+    context = orchestrator.start("work", run_id="prompt-run")
+    assert context.workflow.snapshot.metadata.prompt_digest != "builtin"
+    context.workflow.pause("keyboard_interrupt")
+    prompt.write_text("second")
+    with pytest.raises(CompatibilityError, match="prompt digest"):
+        Orchestrator(repo, harnesses={"fake": FakeHarness([])}, sandbox=sandbox).resume("prompt-run")
+
+
+def test_events_are_persisted_once_and_sent_to_renderer(tmp_path: Path) -> None:
+    class Renderer:
+        def __init__(self) -> None:
+            self.events = []
+
+        def render(self, event) -> None:
+            self.events.append(event)
+
+    repo = _repository(tmp_path); renderer = Renderer()
+    context = Orchestrator(repo, harnesses={"fake": FakeHarness([])}, sandbox=_Sandbox(), event_renderer=renderer).start("work", run_id="events")
+    lines = (context.workflow.artifacts.root / "events.jsonl").read_text().splitlines()
+    assert len(lines) == 1 and len(renderer.events) == 1
+
+
+def test_implementation_retry_counters_are_persisted_per_stage(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    context = Orchestrator(repo, harnesses={"fake": FakeHarness([])}, sandbox=_Sandbox()).start("work", run_id="retries")
+    orchestrator = Orchestrator(repo, harnesses={"fake": FakeHarness([])}, sandbox=_Sandbox())
+    assert orchestrator._reserve_implementation_retry(context, "focused:one")
+    assert orchestrator._reserve_implementation_retry(context, "full")
+    restored = context.workflow.engine.load("retries")
+    assert restored.implementation_attempts == {"focused:one": 1, "full": 1}
+
+
+@pytest.mark.asyncio
+async def test_structured_output_exhaustion_does_not_become_infrastructure_retry(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    harness = FakeHarness([FakeResponse({}), FakeResponse({}), FakeResponse({})])
+    delays: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    orchestrator = Orchestrator(repo, harnesses={"fake": harness}, sandbox=_Sandbox(), sleep=sleep)
+    context = orchestrator.start("work", run_id="structured")
+    with pytest.raises(StructuredOutputError):
+        await orchestrator.plan_turn(context, "work")
+    assert len(harness.requests) == 3
+    assert delays == []
+    assert context.workflow.snapshot.state == RunState.PAUSED
+    assert context.workflow.snapshot.pause_reason == "structured_output_retries_exhausted"
 
 
 def test_preexisting_untouched_test_cannot_satisfy_essential_test_requirement(tmp_path: Path) -> None:

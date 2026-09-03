@@ -29,10 +29,10 @@ def test_waves_are_stable_limited_and_cycle_rejected() -> None:
 
 def test_review_and_retry_policy() -> None:
     from stms.domain.models import Severity
-    assert blocking_findings(1, [Severity.LOW]) == [Severity.LOW]
-    assert blocking_findings(2, [Severity.LOW]) == []
-    assert blocking_findings(3, [Severity.MEDIUM]) == []
-    assert blocking_findings(4, [Severity.HIGH]) == []
-    assert escalates_to_human(4, [Severity.HIGH])
-    assert not escalates_to_human(3, [Severity.HIGH])
+    blocking = {"round_1": [Severity.HIGH], "round_2": [Severity.LOW], "round_3": [], "round_4": []}
+    escalate = {"round_2": [Severity.LOW]}
+    assert blocking_findings(1, [Severity.LOW], blocking) == []
+    assert blocking_findings(2, [Severity.LOW], blocking) == [Severity.LOW]
+    assert escalates_to_human(2, [Severity.LOW], escalate)
+    assert not escalates_to_human(4, [Severity.HIGH], escalate)
     assert planner_gate_required(10) and retry_exhausted(3, 3)

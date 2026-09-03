@@ -106,3 +106,13 @@ class LocalArtifactStore:
             raise SecurityError("Approved untracked file appears to contain a secret.", "Do not copy credentials or secret-bearing files into a worktree.")
         target.parent.mkdir(parents=True, exist_ok=True); shutil.copyfile(source, target)
         return target
+
+
+class JsonlEventSink:
+    """Persist each normalized event exactly once in the run's existing JSONL."""
+
+    def __init__(self, artifacts: LocalArtifactStore) -> None:
+        self._artifacts = artifacts
+
+    def emit(self, event: NormalizedEvent) -> None:
+        self._artifacts.append_event(event)

@@ -8,13 +8,16 @@ from stms.adapters.harnesses.codex import CodexHarness
 from stms.adapters.harnesses.pi import PiHarness
 from stms.adapters.sandbox.srt import SrtSandboxRuntime
 from stms.application.orchestrator import Orchestrator
+from stms.domain.ports import EventRenderer, EventSink
 
 
-def compose(repository: Path) -> Orchestrator:
+def compose(repository: Path, *, event_sink: EventSink | None = None, event_renderer: EventRenderer | None = None) -> Orchestrator:
     """Build the offline-safe application; providers are contacted only after preflight."""
     sandbox = SrtSandboxRuntime()
     return Orchestrator(
         repository,
         harnesses={"codex": CodexHarness(), "claude": ClaudeHarness(), "pi": PiHarness(sandbox=sandbox)},
         sandbox=sandbox,
+        event_sink=event_sink,
+        event_renderer=event_renderer,
     )

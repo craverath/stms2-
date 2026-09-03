@@ -14,10 +14,11 @@ the plan yourself. Include only useful context notes and web URLs actually consu
 
 
 class PlannerAgent:
-    def __init__(self, harness: AgentHarness, prompt_provider: PromptProvider | None = None) -> None:
+    def __init__(self, harness: AgentHarness, prompt_provider: PromptProvider | None = None, *, structured_output_retries: int = 2) -> None:
         self._harness = harness
         self._prompt = resolve_prompt(AgentRole.PLANNER.value, DEFAULT_PROMPT, prompt_provider)
+        self._structured_output_retries = structured_output_retries
 
     async def respond(self, request: HarnessRequest) -> PlannerOutput:
         enriched = request.model_copy(update={"prompt": f"{self._prompt}\n\nRequest:\n{request.prompt}"})
-        return await request_structured(self._harness, enriched, role=AgentRole.PLANNER, output_type=PlannerOutput)
+        return await request_structured(self._harness, enriched, role=AgentRole.PLANNER, output_type=PlannerOutput, structured_output_retries=self._structured_output_retries)

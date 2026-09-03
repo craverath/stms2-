@@ -3,15 +3,29 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
+import tempfile
 from hashlib import sha256
 from typing import Mapping
 
 from stms.domain.errors import InfrastructureError
 
 
+def default_worktrees_root(repository: Path) -> Path:
+    """A deterministic root outside the repository, keyed by its resolved path.
+
+    Worktrees living inside the repository directory (e.g. under ``.stms/``) show
+    up as untracked/nested-git paths in ``git status`` unless painstakingly kept
+    in sync with ``.gitignore``. An external, hash-keyed root avoids that entirely
+    while staying reproducible across processes for the same repository.
+    """
+    digest = sha256(str(repository.resolve()).encode()).hexdigest()[:16]
+    return (Path(tempfile.gettempdir()) / "stms-worktrees" / digest).resolve()
+
+
 class GitWorktreeManager:
-    def __init__(self, repository: Path) -> None:
+    def __init__(self, repository: Path, *, worktrees_root: Path | None = None) -> None:
         self.repository = repository.resolve()
+        self.worktrees_root = (worktrees_root or default_worktrees_root(self.repository)).resolve()
         self._integration: Path | None = None
         self._tasks: dict[str, Path] = {}
         self._run_id: str | None = None
@@ -178,7 +192,7 @@ class GitWorktreeManager:
             self._git(["branch", "-D", f"stms/{self._run_id}/integration"], check=False)
 
     def _worktree_path(self, run_id: str, name: str) -> Path:
-        return self.repository / ".stms" / "worktrees" / run_id / name
+        return self.worktrees_root / run_id / name
 
     def _require_integration(self) -> Path:
         if self._integration is None: raise InfrastructureError("Integration worktree is not initialized.", "Create it before integrating task branches.")

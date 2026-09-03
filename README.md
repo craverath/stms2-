@@ -4,35 +4,52 @@ STMS is a local, deterministic workflow for agent-assisted development on macOS
 and Linux with Python 3.12+. It keeps planning, implementation, testing, review,
 and the final human merge gate auditable without sending telemetry.
 
-## Install
+## Status
 
-Install [uv](https://docs.astral.sh/uv/) first, then install from a Git checkout:
+STMS 0.1.0 is ready for local evaluation from this Git repository. This project
+is not published on PyPI; the package named `stms` there is unrelated. Install
+from the Git URL below. Real-provider conformance checks are still manual.
+
+## Quick start
+
+You need macOS or Linux, Python 3.12+, Git, [uv](https://docs.astral.sh/uv/),
+Node.js 20.11+, and `ripgrep`. Install the Codex CLI, the sandbox runtime, and
+STMS:
 
 ```shell
-uv tool install .
+npm install -g @openai/codex @anthropic-ai/sandbox-runtime
+codex login
+codex login status
+srt --version
+uv tool install "git+https://github.com/craverath/stms2-.git"
 stms --help
 ```
 
-STMS needs a Git repository with a valid `HEAD`, an attached branch, clean
-tracked changes, and configured `user.name` and `user.email`. Untracked files
-are allowed but are never copied into agent worktrees unless the approved plan
-explicitly lists them.
+STMS runs inside the project it will modify. That project must be a Git
+repository with at least one commit, an attached branch, clean tracked files,
+and a configured author:
 
-Install and authenticate the Codex and/or Claude Code harnesses independently.
-STMS does not install packages, authenticate accounts, push, deploy, or weaken
-sandbox policy. Install the Anthropic Sandbox Runtime (`srt`) and check that
-`srt --version` works, unless an equivalent native fallback is explicitly
-allowed in project configuration.
+```shell
+cd /path/to/your-project
+git config user.name "Your Name"
+git config user.email "you@example.com"
+git status
+```
 
-## Configure
+Create `stms.yml` at the repository root from the packaged example:
 
-Create `stms.yml` manually at the project root; STMS deliberately never creates
-it. Start with [`stms.example.yml`](stms.example.yml), set real model IDs, and
-select installed harnesses. Codex and Claude are supported; Pi is experimental.
-Model/effort and sandbox capability mismatches stop preflight with a corrective
-action rather than silently falling back.
+```shell
+curl -fsSL \
+  https://raw.githubusercontent.com/craverath/stms2-/main/src/stms/stms.example.yml \
+  -o stms.yml
+```
 
-## Use
+Edit `stms.yml` before the first run. For the simplest setup, select `codex` for
+all three roles and replace every `example-model` with a model ID available in
+your Codex installation. Keep an effort supported by that model. The complete
+schema and safe defaults are in [`stms.example.yml`](src/stms/stms.example.yml).
+
+Then start a run from the repository root:
 
 ```shell
 stms start "Add a login screen"
@@ -40,6 +57,23 @@ stms start --file PRD.md
 stms resume
 stms resume <run-id>
 ```
+
+To use Claude Code for one or more roles, install STMS with its optional SDK and
+install/authenticate Claude Code before selecting `harness: claude`:
+
+```shell
+uv tool install "stms[claude] @ git+https://github.com/craverath/stms2-.git"
+npm install -g @anthropic-ai/claude-code
+claude
+claude auth status
+```
+
+Codex and Claude are supported; Pi is experimental. STMS deliberately does not
+create `stms.yml`, install project dependencies, authenticate accounts, push,
+deploy, or weaken sandbox policy. A missing harness, unavailable model/effort,
+or incompatible sandbox stops preflight with a corrective action.
+
+## Workflow
 
 `start` accepts exactly one prompt or `--file`. Preflight runs before a run,
 lock, branch, or worktree is created. The planner asks at most three related

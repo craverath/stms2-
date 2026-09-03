@@ -3,9 +3,10 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from stms.application.configuration import load_runtime_config, verify_frozen_config
+from stms.application.configuration import configuration_example, load_runtime_config, verify_frozen_config
 from stms.domain.errors import ConfigurationError
-from stms.domain.models import ApprovedPlan, PlanTask, AcceptanceCriterion, RuntimeConfig, TaskDependency, TestCommand
+from stms.domain.models import ApprovedPlan, PlanTask, AcceptanceCriterion, ReviewConfig, RuntimeConfig, TaskDependency, TestCommand
+from stms.deterministic.test_discovery import discover_test_commands
 
 
 def plan() -> ApprovedPlan:
@@ -30,7 +31,7 @@ def test_command_environment_uses_references_not_secret_literals() -> None:
 
 
 def test_config_loads_and_digest_detects_change(tmp_path: Path) -> None:
-    config = Path("stms.example.yml").read_text(); (tmp_path / "stms.yml").write_text(config)
+    (tmp_path / "stms.yml").write_text(configuration_example())
     loaded = load_runtime_config(tmp_path)
     assert loaded.version == 1
     verify_frozen_config(loaded, loaded.digest())
@@ -43,5 +44,38 @@ def test_missing_config_supplies_example_without_creating_file(tmp_path: Path) -
 
 
 def test_config_rejects_unknown_keys(tmp_path: Path) -> None:
-    (tmp_path / "stms.yml").write_text(Path("stms.example.yml").read_text() + "\nunsupported: true\n")
+    (tmp_path / "stms.yml").write_text(configuration_example() + "\nunsupported: true\n")
     with pytest.raises(ConfigurationError): load_runtime_config(tmp_path)
+
+
+def test_example_config_is_packaged_and_readable_via_importlib_resources() -> None:
+    assert "version: 1" in configuration_example()
+
+
+def test_review_config_requires_complete_rounds_and_non_empty_descriptions() -> None:
+    valid = {
+        "severities": {"high": "high", "medium": "medium", "low": "low"},
+        "blocking": {"round_1": ["high"], "round_2": [], "round_3": [], "round_4": []},
+        "escalate": {"round_4": ["high"]},
+    }
+    assert ReviewConfig.model_validate(valid).blocking["round_1"]
+    with pytest.raises(ValidationError):
+        ReviewConfig.model_validate({**valid, "blocking": {"round_1": ["high"]}})
+    with pytest.raises(ValidationError):
+        ReviewConfig.model_validate({**valid, "severities": {"high": "", "medium": "medium", "low": "low"}})
+
+
+def test_tests_timeout_applies_only_when_command_has_no_override(tmp_path: Path) -> None:
+    config = configuration_example().replace("timeout_seconds: 900\n  commands: []", "timeout_seconds: 37\n  commands:\n    - argv: [pytest]\n    - argv: [pytest, slow]\n      timeout_seconds: 99")
+    (tmp_path / "stms.yml").write_text(config)
+    commands = load_runtime_config(tmp_path).tests.commands
+    assert [command.timeout_seconds for command in commands] == [37, 99]
+
+
+def test_discovered_and_proposed_commands_inherit_configured_timeout(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\nversion='1'\n")
+    assert discover_test_commands(tmp_path, [], default_timeout_seconds=41)[0].timeout_seconds == 41
+    (tmp_path / "pyproject.toml").unlink()
+    proposed = [TestCommand(argv=["custom"]), TestCommand(argv=["slow"], timeout_seconds=88)]
+    selected = discover_test_commands(tmp_path, [], proposed, default_timeout_seconds=41)
+    assert [command.timeout_seconds for command in selected] == [41, 88]

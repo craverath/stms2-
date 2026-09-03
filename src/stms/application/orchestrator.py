@@ -13,20 +13,22 @@ from stms.adapters.persistence.artifact_store import LocalArtifactStore
 from stms.adapters.persistence.langgraph_engine import LocalWorkflowEngine
 from stms.adapters.persistence.sqlite_store import SQLiteCheckpointStore, resumable_run_exists
 from stms.agents.implementer import ImplementerAgent
-from stms.agents.planner import PlannerAgent
-from stms.agents.reviewer import ReviewerAgent
+from stms.agents.implementer import DEFAULT_PROMPT as IMPLEMENTER_PROMPT
+from stms.agents.planner import DEFAULT_PROMPT as PLANNER_PROMPT, PlannerAgent
+from stms.agents.prompts import FilePromptProvider, prompt_digest
+from stms.agents.reviewer import DEFAULT_PROMPT as REVIEWER_PROMPT, ReviewerAgent
 from stms.application.preflight import PreflightService
 from stms.application.configuration import verify_frozen_config
 from stms.application.scheduler import task_waves
 from stms.deterministic.test_discovery import discover_test_commands
 from stms.application.workflow import RunWorkflow
-from stms.domain.errors import DomainError, InfrastructureError
+from stms.domain.errors import DomainError, InfrastructureError, StructuredOutputError
 from stms.domain.models import (
     AgentConfig, AgentRole, AllowedEvent, ApprovedPlan, HarnessRequest, RunMetadata,
     RunState, RuntimeConfig, PlanTask, TestCommand, StrictModel, PlannerOutput, ImplementerOutput, ReviewerOutput,
 )
-from stms.domain.policies import blocking_findings, escalates_to_human
-from stms.domain.ports import AgentHarness, SandboxRuntime
+from stms.domain.policies import blocking_findings, escalates_to_human, retry_exhausted
+from stms.domain.ports import AgentHarness, EventRenderer, EventSink, PromptProvider, SandboxRuntime
 from stms.deterministic.test_runner import DeterministicTestRunner
 from stms.deterministic.worktree_manager import GitWorktreeManager
 
@@ -52,11 +54,19 @@ class Orchestrator:
         harnesses: Mapping[str, AgentHarness],
         sandbox: SandboxRuntime,
         worktrees: GitWorktreeManager | None = None,
+        event_sink: EventSink | None = None,
+        event_renderer: EventRenderer | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        infrastructure_backoff_seconds: float = 1.0,
     ) -> None:
         self.repository = repository.resolve()
         self.harnesses = harnesses
         self.sandbox = sandbox
         self.worktrees = worktrees or GitWorktreeManager(self.repository)
+        self.event_sink = event_sink
+        self.event_renderer = event_renderer
+        self._sleep = sleep
+        self._infrastructure_backoff_seconds = infrastructure_backoff_seconds
 
     def start(self, request_text: str, *, run_id: str | None = None) -> RunContext:
         if not request_text.strip():
@@ -64,6 +74,8 @@ class Orchestrator:
         # Preflight is deliberately fully read-only.  Constructing the SQLite
         # control store creates WAL files, so it occurs only after validation.
         preflight = PreflightService(self.repository, self.harnesses, self.sandbox).validate()
+        prompts = self._prompt_provider(preflight.config)
+        effective_prompt_digest = prompt_digest(prompts)
         if resumable_run_exists(self.repository):
             raise InfrastructureError("Repository already has a resumable STMS run.", "Use stms resume or abort the existing run before starting another one.")
         control = self._control_store()
@@ -76,9 +88,9 @@ class Orchestrator:
             metadata = RunMetadata(
                 run_id=identifier, repository=str(self.repository), branch_base=preflight.branch_base,
                 commit_base=preflight.commit_base, config_digest=preflight.config.digest(),
-                prompt_digest="builtin", adapter_versions=preflight.adapter_versions,
+                prompt_digest=effective_prompt_digest, adapter_versions=preflight.adapter_versions,
             )
-            workflow = RunWorkflow.new(engine, artifacts, metadata)
+            workflow = RunWorkflow.new(engine, artifacts, metadata, event_sink=self.event_sink, event_renderer=self.event_renderer)
             artifacts.write_text("request.md", request_text)
             return RunContext(workflow, preflight.config, self.repository)
         except Exception:
@@ -88,8 +100,11 @@ class Orchestrator:
     async def plan_turn(self, context: RunContext, user_text: str) -> object:
         self._require_state(context, RunState.INTERVIEWING)
         agent_config = context.config.agents[AgentRole.PLANNER]
-        agent = PlannerAgent(self._harness(agent_config.harness))
-        policy = self._prepare_policy(AgentRole.PLANNER, context.repository, context.config)
+        agent = PlannerAgent(
+            self._harness(agent_config.harness), self._prompt_provider(context.config),
+            structured_output_retries=context.config.workflow.structured_output_retries,
+        )
+        policy = await self._external_retry(context, "sandbox:planner", lambda: asyncio.to_thread(self._prepare_policy, AgentRole.PLANNER, context.repository, context.config))
         artifacts = context.workflow.artifacts
         history = self._planning_history(artifacts)
         history.append({"speaker": "user", "text": user_text})
@@ -111,7 +126,10 @@ class Orchestrator:
             return response
         assert response.plan is not None
         context.context_markdown = self._context_markdown(response.context_notes, response.web_sources)
-        effective_commands = discover_test_commands(context.repository, context.config.tests.commands, response.plan.test_commands)
+        effective_commands = discover_test_commands(
+            context.repository, context.config.tests.commands, response.plan.test_commands,
+            default_timeout_seconds=context.config.tests.timeout_seconds,
+        )
         if effective_commands:
             # Discovery precedence is frozen into the approved artifact.
             response = response.model_copy(update={"plan": response.plan.model_copy(update={"test_commands": effective_commands})})
@@ -149,18 +167,42 @@ class Orchestrator:
         plan = context.plan or self._load_plan(context.workflow.artifacts)
         context.plan = plan
         if context.integration is None:
-            created = context.workflow.effect("integration-worktree", ("create",), lambda: self.worktrees.create_integration(context.workflow.snapshot.metadata.run_id, context.workflow.snapshot.metadata.commit_base))
-            context.integration = created or self.worktrees.create_integration(context.workflow.snapshot.metadata.run_id, context.workflow.snapshot.metadata.commit_base)
-        elif context.correction_context:
+            created = await self._external_retry(
+                context,
+                "worktree:integration",
+                lambda: asyncio.to_thread(
+                    context.workflow.effect,
+                    "integration-worktree",
+                    ("create",),
+                    lambda: self.worktrees.create_integration(context.workflow.snapshot.metadata.run_id, context.workflow.snapshot.metadata.commit_base),
+                ),
+            )
+            context.integration = created or await self._external_retry(
+                context,
+                "worktree:integration:reconcile",
+                lambda: asyncio.to_thread(self.worktrees.create_integration, context.workflow.snapshot.metadata.run_id, context.workflow.snapshot.metadata.commit_base),
+            )
+            context.workflow.observe("worktree-created", result=str(context.integration))
+        elif context.correction_context and not (context.workflow.snapshot.correction_stage or "").startswith("focused:"):
             return await self._correct_integration(context)
         for wave_index, wave in enumerate(task_waves(plan, context.config.workflow.max_parallel_tasks)):
             if wave_index < context.workflow.snapshot.completed_waves:
                 continue
             base = self._git_head(context.integration)
-            task_paths = {task.id: self.worktrees.create_task(context.workflow.snapshot.metadata.run_id, task.id, base) for task in wave}
+            task_paths = {
+                task.id: await self._external_retry(
+                    context, f"worktree:task:{task.id}",
+                    lambda task=task: asyncio.to_thread(self.worktrees.create_task, context.workflow.snapshot.metadata.run_id, task.id, base),
+                )
+                for task in wave
+            }
             outputs = await self._implement_wave(context, wave, task_paths)
             if not all(outputs.values()):
                 return False
+            if context.workflow.snapshot.correction_stage and context.workflow.snapshot.correction_stage.startswith("focused:"):
+                context.workflow.replace_snapshot(context.workflow.snapshot.model_copy(update={"correction_stage": None}), event_type="focused-correction-completed")
+                context.correction_context = ""
+                context.workflow.artifacts.write_text("correction.md", "")
             for task in wave:
                 try:
                     commit_id = context.workflow.operation_id("task-commit", task.id)
@@ -196,28 +238,36 @@ class Orchestrator:
                 except InfrastructureError:
                     context.correction_context = self._correction_evidence(context, "integration_conflict")
                     context.workflow.artifacts.write_text("correction.md", context.correction_context)
-                    return self._return_to_implementation(context, "integration_conflict")
+                    return self._return_to_implementation(context, "integration_conflict", f"conflict:{task.id}")
             snapshot = context.workflow.snapshot.model_copy(update={
                 "completed_task_ids": [*context.workflow.snapshot.completed_task_ids, *(task.id for task in wave if task.id not in context.workflow.snapshot.completed_task_ids)],
                 "completed_waves": wave_index + 1,
             })
             context.workflow.replace_snapshot(snapshot, event_type="wave-integrated")
         context.workflow.apply(AllowedEvent.TASKS_READY, result="tasks_integrated")
-        return self.run_full_tests(context)
+        return await self.run_full_tests(context)
 
-    def run_full_tests(self, context: RunContext) -> bool:
+    async def run_full_tests(self, context: RunContext) -> bool:
         self._require_state(context, RunState.TESTING)
         plan = context.plan or self._load_plan(context.workflow.artifacts)
         cwd = context.integration or self.repository
-        policy = self._prepare_policy(AgentRole.TEST_RUNNER, cwd, context.config)
+        policy = await self._external_retry(
+            context, "sandbox:test:full",
+            lambda: asyncio.to_thread(self._prepare_policy, AgentRole.TEST_RUNNER, cwd, context.config),
+        )
         runner = DeterministicTestRunner(artifact_store=context.workflow.artifacts, sandbox=self.sandbox, policy_path=policy)
-        results = [self._test_attempt(context, runner, command, cwd, "full", str(context.workflow.snapshot.attempt), str(index)) for index, command in enumerate(self._commands(context))]
+        results = [
+            await self._test_attempt_async(context, runner, command, cwd, "full", str(context.workflow.snapshot.attempt), str(index))
+            for index, command in enumerate(self._commands(context))
+        ]
         if all(attempt.result.succeeded for attempt in results):
+            if context.workflow.snapshot.correction_stage is not None:
+                context.workflow.replace_snapshot(context.workflow.snapshot.model_copy(update={"correction_stage": None}), event_type="correction-stage-completed")
             context.workflow.apply(AllowedEvent.TESTS_PASSED, result="full_suite_passed")
             return True
         context.correction_context = self._correction_evidence(context, "full_suite_failed")
         context.workflow.artifacts.write_text("correction.md", context.correction_context)
-        return self._return_to_implementation(context, "full_suite_failed")
+        return self._return_to_implementation(context, "full_suite_failed", context.workflow.snapshot.correction_stage or "full")
 
     async def review(self, context: RunContext) -> bool:
         self._require_state(context, RunState.REVIEWING)
@@ -229,30 +279,42 @@ class Orchestrator:
         context_text = (context.workflow.artifacts.root / "context.md").read_text(encoding="utf-8")
         logs = "\n".join(path.read_text(encoding="utf-8", errors="replace")[-4000:] for path in sorted((context.workflow.artifacts.root / "tests").glob("*.log"))[-3:])
         request_text = f"Approved plan:\n{plan_text}\nContext:\n{context_text}\nTest results/logs:\n{logs}\nPrior findings:\n{context.correction_context}\nDiff:\n{diff}"
-        policy = self._prepare_policy(AgentRole.REVIEWER, integration, context.config)
+        policy = await self._external_retry(
+            context, f"sandbox:reviewer:{current}",
+            lambda: asyncio.to_thread(self._prepare_policy, AgentRole.REVIEWER, integration, context.config),
+        )
         output = await self._harness_invocation(
             context, "reviewer", (str(current),), f"harness/reviewer-{current}.json", ReviewerOutput,
-            lambda: ReviewerAgent(self._harness(agent_config.harness)).review(self._request(AgentRole.REVIEWER, agent_config, integration, request_text, policy)),
+            lambda: ReviewerAgent(
+                self._harness(agent_config.harness), self._prompt_provider(context.config),
+                severity_descriptions=context.config.review.severities,
+                structured_output_retries=context.config.workflow.structured_output_retries,
+            ).review(self._request(AgentRole.REVIEWER, agent_config, integration, request_text, policy)),
             {"prompt": request_text, "diff": diff, "plan": self._plan_markdown(context.plan or self._load_plan(context.workflow.artifacts))},
         )
         context.workflow.artifacts.write_review(str(current), output.model_dump(mode="json"))
         severities = [finding.severity for finding in output.findings]
+        blocking_severities = blocking_findings(current, severities, context.config.review.blocking)
+        blocking = [finding for finding in output.findings if finding.severity in set(blocking_severities)]
         context.correction_context = "Blocking review findings:\n" + "\n".join(
-            f"- {finding.id} ({finding.severity}): {finding.evidence}; fix: {finding.suggested_fix}" for finding in output.findings
+            f"- {finding.id} ({finding.severity}): {finding.evidence}; fix: {finding.suggested_fix}" for finding in blocking
         )
-        context.workflow.artifacts.write_text("correction.md", context.correction_context)
+        context.workflow.artifacts.write_text("correction.md", context.correction_context if blocking else "")
         snapshot = context.workflow.snapshot.model_copy(update={"review_round": current})
         context.workflow.replace_snapshot(snapshot, event_type="review-completed")
-        if escalates_to_human(current, severities):
+        if escalates_to_human(current, severities, context.config.review.escalate):
             context.workflow.pause("review_round_4_high")
             return False
-        if blocking_findings(current, severities):
+        if blocking:
+            if not self._reserve_implementation_retry(context, f"review:{current}"):
+                return False
             context.workflow.replace_snapshot(
                 context.workflow.snapshot.model_copy(update={"review_round": min(current + 1, 4)}),
                 event_type="review-next-round",
             )
             context.workflow.apply(AllowedEvent.REVIEW_BLOCKING, result=f"review_round_{current}_blocking")
             return False
+        context.correction_context = ""
         context.workflow.apply(AllowedEvent.REVIEW_ACCEPTED, result=f"review_round_{current}_accepted")
         return True
 
@@ -266,7 +328,7 @@ class Orchestrator:
             context.correction_context = f"Human final adjustment:\n{details}"
             context.workflow.artifacts.write_text("correction.md", context.correction_context)
             context.workflow.apply(AllowedEvent.ADJUST, result="final_adjustment")
-            context.workflow.replace_snapshot(context.workflow.snapshot.model_copy(update={"review_round": None}), event_type="review_reset")
+            context.workflow.replace_snapshot(context.workflow.snapshot.model_copy(update={"review_round": None, "correction_stage": "final_adjustment"}), event_type="review_reset")
         elif decision == "replan":
             context.workflow.apply(AllowedEvent.REPLAN, result="human_replan")
             context.workflow.apply(AllowedEvent.FEEDBACK, result="return_to_interview")
@@ -291,10 +353,11 @@ class Orchestrator:
             if snapshot is None or snapshot.state in {RunState.COMPLETED, RunState.FAILED}:
                 continue
             preflight = PreflightService(self.repository, self.harnesses, self.sandbox).validate()
-            store.verify_compatibility(snapshot, config_digest=preflight.config.digest(), workflow_version="1", prompt_digest="builtin", adapter_versions=preflight.adapter_versions)
+            prompts = self._prompt_provider(preflight.config)
+            store.verify_compatibility(snapshot, config_digest=preflight.config.digest(), workflow_version="1", prompt_digest=prompt_digest(prompts), adapter_versions=preflight.adapter_versions)
             self._control_store().acquire_lock(self.repository, snapshot.metadata.run_id)
             artifacts = LocalArtifactStore(self.repository, snapshot.metadata.run_id)
-            workflow = RunWorkflow(LocalWorkflowEngine(store), artifacts, snapshot)
+            workflow = RunWorkflow(LocalWorkflowEngine(store), artifacts, snapshot, event_sink=self.event_sink, event_renderer=self.event_renderer)
             workflow.resume()
             correction = (artifacts.root / "correction.md")
             integration = None
@@ -312,29 +375,50 @@ class Orchestrator:
         async def run(task: PlanTask) -> tuple[str, bool]:
             async with semaphore:
                 path = task_paths[task.id]
+                context.workflow.observe("task-started", task_id=task.id, result=str(path))
                 for approved in plan.untracked_files:
-                    context.workflow.artifacts.copy_approved_untracked(approved, path)
-                before_files = self._worktree_fingerprints(path)
-                policy = self._prepare_policy(AgentRole.IMPLEMENTER, path, context.config)
+                    await self._external_retry(
+                        context, f"copy-untracked:{task.id}:{approved.source}",
+                        lambda approved=approved: asyncio.to_thread(context.workflow.artifacts.copy_approved_untracked, approved, path),
+                    )
+                before_files = await asyncio.to_thread(self._worktree_fingerprints, path)
+                policy = await self._external_retry(
+                    context, f"sandbox:implementer:{task.id}",
+                    lambda: asyncio.to_thread(self._prepare_policy, AgentRole.IMPLEMENTER, path, context.config),
+                )
                 prompt = f"Implement task {task.id}.\n{context.correction_context}"
                 response = await self._harness_invocation(
                     context, "implementer", (str(context.workflow.snapshot.attempt), task.id), f"harness/implementer-{context.workflow.snapshot.attempt}-{task.id}.json", ImplementerOutput,
-                    lambda: ImplementerAgent(self._harness(agent_config.harness)).implement(self._request(AgentRole.IMPLEMENTER, agent_config, path, prompt, policy), task, plan, context.context_markdown),
+                    lambda: ImplementerAgent(
+                        self._harness(agent_config.harness), self._prompt_provider(context.config),
+                        structured_output_retries=context.config.workflow.structured_output_retries,
+                    ).implement(self._request(AgentRole.IMPLEMENTER, agent_config, path, prompt, policy), task, plan, context.context_markdown),
                     {"prompt": prompt, "task": task.model_dump(mode="json"), "context": context.context_markdown},
                 )
-                if not self._valid_implementation_report(task, response, path, before_files):
+                if not await asyncio.to_thread(self._valid_implementation_report, task, response, path, before_files):
                     return task.id, False
                 if response.requires_human_gate:
                     return task.id, False
                 commands = [self._commands(context)[index] for index in task.focused_test_commands if index < len(self._commands(context))] or self._commands(context)
-                test_policy = self._prepare_policy(AgentRole.TEST_RUNNER, path, context.config)
+                test_policy = await self._external_retry(
+                    context, f"sandbox:test:{task.id}",
+                    lambda: asyncio.to_thread(self._prepare_policy, AgentRole.TEST_RUNNER, path, context.config),
+                )
                 runner = DeterministicTestRunner(artifact_store=context.workflow.artifacts, sandbox=self.sandbox, policy_path=test_policy)
-                return task.id, all(self._test_attempt(context, runner, command, path, "focused", str(context.workflow.snapshot.attempt), task.id, str(index)).result.succeeded for index, command in enumerate(commands))
+                attempts = []
+                for index, command in enumerate(commands):
+                    attempts.append(await self._test_attempt_async(context, runner, command, path, "focused", str(context.workflow.snapshot.attempt), task.id, str(index)))
+                succeeded = all(attempt.result.succeeded for attempt in attempts)
+                context.workflow.observe("task-tests-completed", task_id=task.id, result="passed" if succeeded else "failed")
+                return task.id, succeeded
 
         completed = await asyncio.gather(*(run(task) for task in tasks))
         result = dict(completed)
         if not all(result.values()):
-            self._return_to_implementation(context, "focused_test_or_human_gate_failed")
+            failed_task = next(task.id for task in tasks if not result[task.id])
+            context.correction_context = self._focused_correction_evidence(context, failed_task, task_paths[failed_task])
+            context.workflow.artifacts.write_text("correction.md", context.correction_context)
+            self._return_to_implementation(context, "focused_test_or_human_gate_failed", f"focused:{failed_task}")
         return result
 
     def _merge(self, context: RunContext) -> None:
@@ -364,14 +448,27 @@ class Orchestrator:
         context.workflow.apply(AllowedEvent.MERGE_SUCCEEDED, result="squash_merged")
         self._control_store().release_lock(self.repository, metadata.run_id)
 
-    def _return_to_implementation(self, context: RunContext, result: str) -> bool:
+    def _return_to_implementation(self, context: RunContext, result: str, stage: str) -> bool:
+        if not self._reserve_implementation_retry(context, stage):
+            return False
         if context.workflow.snapshot.state == RunState.TESTING:
             context.workflow.apply(AllowedEvent.TESTS_FAILED, result=result)
-        snapshot = context.workflow.snapshot.model_copy(update={"attempt": context.workflow.snapshot.attempt + 1})
-        context.workflow.replace_snapshot(snapshot, event_type="implementation_retry")
-        if snapshot.attempt >= context.config.workflow.implementation_retries:
-            context.workflow.pause("implementation_retries_exhausted")
         return False
+
+    def _reserve_implementation_retry(self, context: RunContext, stage: str) -> bool:
+        used = context.workflow.snapshot.implementation_attempts.get(stage, 0)
+        if retry_exhausted(used, context.config.workflow.implementation_retries):
+            context.workflow.pause(f"implementation_retries_exhausted:{stage}")
+            return False
+        counters = dict(context.workflow.snapshot.implementation_attempts)
+        counters[stage] = used + 1
+        snapshot = context.workflow.snapshot.model_copy(update={
+            "attempt": context.workflow.snapshot.attempt + 1,
+            "implementation_attempts": counters,
+            "correction_stage": stage,
+        })
+        context.workflow.replace_snapshot(snapshot, event_type="implementation_retry")
+        return True
 
     async def _correct_integration(self, context: RunContext) -> bool:
         """Use a fresh implementer session in the integration worktree for fixes."""
@@ -379,28 +476,41 @@ class Orchestrator:
         plan = context.plan or self._load_plan(context.workflow.artifacts)
         assert plan is not None
         config = context.config.agents[AgentRole.IMPLEMENTER]
-        policy = self._prepare_policy(AgentRole.IMPLEMENTER, context.integration, context.config)
+        policy = await self._external_retry(
+            context, "sandbox:corrector",
+            lambda: asyncio.to_thread(self._prepare_policy, AgentRole.IMPLEMENTER, context.integration, context.config),
+        )
         operation_id = context.workflow.operation_id("harness-corrector", str(context.workflow.snapshot.attempt))
         artifact = f"corrections/{operation_id}.json"
         report = await self._harness_invocation(
             context, "corrector", (str(context.workflow.snapshot.attempt),), artifact, ImplementerOutput,
-            lambda: ImplementerAgent(self._harness(config.harness)).implement(self._request(AgentRole.IMPLEMENTER, config, context.integration, context.correction_context, policy), plan.tasks[0], plan, context.context_markdown),
+            lambda: ImplementerAgent(
+                self._harness(config.harness), self._prompt_provider(context.config),
+                structured_output_retries=context.config.workflow.structured_output_retries,
+            ).implement(self._request(AgentRole.IMPLEMENTER, config, context.integration, context.correction_context, policy), plan.tasks[0], plan, context.context_markdown),
             {"prompt": context.correction_context, "diff": self._git_diff(context.integration, context.workflow.snapshot.metadata.commit_base)},
         )
         if report.requires_human_gate:
             context.workflow.pause("correction_requires_human_gate")
             return False
         context.workflow.effect("integration-correction-commit", (str(context.workflow.snapshot.attempt),), lambda: self.worktrees.commit_integration(f"stms correction {context.workflow.snapshot.attempt}"))
-        context.correction_context = ""
-        context.workflow.artifacts.write_text("correction.md", "")
         context.workflow.apply(AllowedEvent.TASKS_READY, result="integration_correction_ready")
-        return self.run_full_tests(context)
+        return await self.run_full_tests(context)
 
     def _correction_evidence(self, context: RunContext, reason: str) -> str:
         logs = sorted(context.workflow.artifacts.root.glob("tests/*.log"))
         log_references = "\n".join(f"- {path.relative_to(context.workflow.artifacts.root)}" for path in logs[-5:])
         integration = context.integration or self.repository
         return f"Correction required: {reason}\nTest logs:\n{log_references}\nIntegrated diff:\n{self._git_diff(integration, context.workflow.snapshot.metadata.commit_base)}"
+
+    def _focused_correction_evidence(self, context: RunContext, task_id: str, worktree: Path) -> str:
+        logs = sorted(context.workflow.artifacts.root.glob("tests/*.log"))
+        log_references = "\n".join(f"- {path.relative_to(context.workflow.artifacts.root)}" for path in logs[-5:])
+        diff = subprocess.run(
+            ["git", "diff", context.workflow.snapshot.metadata.commit_base],
+            cwd=worktree, text=True, capture_output=True, check=True,
+        ).stdout
+        return f"Correction required: focused tests failed for {task_id}\nTest logs:\n{log_references}\nTask diff:\n{diff}"
 
     @staticmethod
     def _valid_implementation_report(task: PlanTask, report: ImplementerOutput, worktree: Path, before_files: dict[str, str]) -> bool:
@@ -482,9 +592,30 @@ class Orchestrator:
             from stms.domain.models import TestAttempt
             return TestAttempt.model_validate_json(existing.read_text(encoding="utf-8"))
         context.workflow.engine.checkpoint_before(context.workflow.snapshot, operation_id, "test")
-        attempt = runner.run_attempt(command, cwd, repository=self.repository)
+        # The worktree/integration tree itself is the process boundary: worktrees
+        # are created outside the repository (see GitWorktreeManager), so bounding
+        # by the repository here would incorrectly reject every legitimate run.
+        attempt = runner.run_attempt(command, cwd)
         context.workflow.artifacts.write_json(artifact, attempt.model_dump(mode="json"))
         context.workflow.engine.checkpoint_after(context.workflow.snapshot, operation_id, artifact)
+        context.workflow.observe("test-completed", result="passed" if attempt.result.succeeded else "failed", duration_seconds=attempt.result.duration_seconds)
+        return attempt
+
+    async def _test_attempt_async(self, context: RunContext, runner: DeterministicTestRunner, command: TestCommand, cwd: Path, scope: str, *parts: str):
+        operation_id = context.workflow.operation_id("test", scope, *parts)
+        artifact = f"tests/{operation_id}.json"
+        existing = context.workflow.artifacts.root / artifact
+        if context.workflow.confirmed(operation_id) and existing.exists():
+            from stms.domain.models import TestAttempt
+            return TestAttempt.model_validate_json(existing.read_text(encoding="utf-8"))
+        context.workflow.engine.checkpoint_before(context.workflow.snapshot, operation_id, "test")
+        attempt = await self._external_retry(
+            context, f"test-process:{scope}:{':'.join(parts)}",
+            lambda: asyncio.to_thread(runner.run_attempt, command, cwd),
+        )
+        context.workflow.artifacts.write_json(artifact, attempt.model_dump(mode="json"))
+        context.workflow.engine.checkpoint_after(context.workflow.snapshot, operation_id, artifact)
+        context.workflow.observe("test-completed", result="passed" if attempt.result.succeeded else "failed", duration_seconds=attempt.result.duration_seconds)
         return attempt
 
     Output = TypeVar("Output", bound=StrictModel)
@@ -501,16 +632,45 @@ class Orchestrator:
             context.workflow.pause("ambiguous_harness_invocation")
             raise InfrastructureError("Harness invocation is pending or has no persisted typed output.", "Inspect the provider session/artifacts and resolve the run manually; STMS will not duplicate the request.")
         context.workflow.engine.checkpoint_before(context.workflow.snapshot, operation_id, f"harness-{kind}")
-        output = await call()
+        try:
+            output = await self._external_retry(context, f"harness:{kind}", call)
+        except StructuredOutputError:
+            context.workflow.pause("structured_output_retries_exhausted")
+            raise
         context.workflow.artifacts.write_json(artifact, {"operation_id": operation_id, "session_id": None, "evidence": evidence, "output": output.model_dump(mode="json")})
         context.workflow.engine.checkpoint_after(context.workflow.snapshot, operation_id, artifact)
         return output
+
+    async def _external_retry(self, context: RunContext, stage: str, call: Callable[[], Awaitable[Output]]) -> Output:
+        retries = context.config.workflow.infrastructure_retries
+        attempt = 0
+        while True:
+            try:
+                return await call()
+            except StructuredOutputError:
+                raise
+            except (InfrastructureError, OSError):
+                if retry_exhausted(attempt, retries):
+                    context.workflow.pause(f"infrastructure_retries_exhausted:{stage}")
+                    raise
+                attempt += 1
+                context.workflow.observe("infrastructure-retry", result=stage)
+                await self._sleep(self._infrastructure_backoff_seconds * attempt)
 
     def _harness(self, name: str) -> AgentHarness:
         return self.harnesses[name]
 
     def _control_store(self) -> SQLiteCheckpointStore:
         return SQLiteCheckpointStore(self.repository / ".stms" / "control.sqlite")
+
+    def _prompt_provider(self, config: RuntimeConfig) -> PromptProvider:
+        defaults = {
+            AgentRole.PLANNER.value: PLANNER_PROMPT,
+            AgentRole.IMPLEMENTER.value: IMPLEMENTER_PROMPT,
+            AgentRole.REVIEWER.value: REVIEWER_PROMPT,
+        }
+        paths = {role.value: config.agents[role].prompt for role in (AgentRole.PLANNER, AgentRole.IMPLEMENTER, AgentRole.REVIEWER)}
+        return FilePromptProvider(self.repository, paths, defaults)
 
     @staticmethod
     def _require_state(context: RunContext, state: RunState) -> None:
