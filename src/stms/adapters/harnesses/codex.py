@@ -67,8 +67,8 @@ class CodexAppServerTransport:
         except (OSError, subprocess.SubprocessError, InfrastructureError):
             return {"authenticated": True, "model": False, "effort": False}
         entry = _catalog_model(catalog, model)
-        efforts = entry.get("supportedReasoningEfforts", entry.get("reasoningEfforts", entry.get("efforts", []))) if entry else []
-        return {"authenticated": True, "model": entry is not None, "effort": entry is not None and isinstance(efforts, list) and effort in efforts}
+        efforts = _catalog_efforts(entry) if entry else set()
+        return {"authenticated": True, "model": entry is not None, "effort": effort in efforts}
 
     def _read_catalog(self) -> Mapping[str, Any]:
         process = subprocess.Popen([self.executable, "app-server", "--stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
@@ -155,6 +155,16 @@ def _catalog_model(catalog: Mapping[str, Any], requested: str) -> Mapping[str, A
         if requested in {item.get("id"), item.get("name")} or isinstance(aliases, list) and requested in aliases:
             return item
     return None
+
+def _catalog_efforts(model: Mapping[str, Any]) -> set[str]:
+    efforts = model.get("supportedReasoningEfforts", model.get("reasoningEfforts", model.get("efforts", [])))
+    if not isinstance(efforts, list):
+        return set()
+    return {
+        value
+        for item in efforts
+        if isinstance(value := item.get("reasoningEffort") if isinstance(item, Mapping) else item, str)
+    }
 
 class CodexSdkTransport:
     """Test-only legacy boundary retained for injected SDK doubles.
