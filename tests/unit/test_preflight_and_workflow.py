@@ -66,6 +66,29 @@ def test_preflight_allows_untracked_but_rejects_tracked_changes(tmp_path: Path) 
         PreflightService(repo, {"fake": harness}, _Sandbox()).validate()
 
 
+def test_doctor_aggregates_readiness_without_creating_runtime_state(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    marker = repo / "project-test-ran"
+    project_test = repo / "doctor-project-test"
+    project_test.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    project_test.chmod(0o755)
+    config = (repo / "stms.yml").read_text(encoding="utf-8").replace(
+        "review:\n",
+        "tests:\n  commands:\n    - argv: [./doctor-project-test]\n      cwd: .\nreview:\n",
+    )
+    (repo / "stms.yml").write_text(config, encoding="utf-8")
+
+    result = PreflightService(repo, {"fake": FakeHarness([])}, _Sandbox()).diagnose()
+
+    assert result.ready
+    assert {item.name for item in result.diagnostics} >= {
+        "git.root", "git.head", "git.branch", "git.clean", "git.identity",
+        "config", "harness.planner", "sandbox", "test.0", "runs", "lock",
+    }
+    assert not marker.exists()
+    assert not (repo / ".stms").exists()
+
+
 @pytest.mark.parametrize(("probe", "message"), [
     ({"authenticated": False, "model": True, "effort": True}, "not authenticated"),
     ({"authenticated": True, "model": False, "effort": True}, "cannot use model"),

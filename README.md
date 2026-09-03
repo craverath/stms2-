@@ -54,6 +54,14 @@ stms start "Add a login screen"
 stms start --file PRD.md
 stms resume
 stms resume <run-id>
+stms doctor
+stms config validate
+stms runs
+stms status [run-id]
+stms logs <run-id>
+stms abort <run-id> --yes
+stms clean --dry-run
+stms --version
 ```
 
 Update the installed command with:
@@ -116,6 +124,18 @@ Common preflight fixes: run from the repository root, make tracked changes
 clean, create `stms.yml`, configure Git identity, finish an existing run, and
 install/configure the selected harness and sandbox. Provider sessions are
 auxiliary: a lost session is rehydrated from persisted state.
+
+`doctor`, `runs`, `status`, `logs`, and `config validate` are diagnostic: they
+do not create `.stms`, SQLite/WAL files, locks, or worktrees and never execute
+the project's configured test commands. `doctor` does execute the harness
+authentication/catalog checks and the sandbox runtime's own functional probe;
+these diagnostic subprocesses do not start agents or a workflow run.
+`runs` and `status` read SQLite as the source of truth. `abort` refuses a live
+owner, records an audited `ABORT` transition, releases its administrative lock,
+and preserves branches, worktrees, and artifacts. `clean` removes only direct,
+non-symlink artifact directories for repository-owned `COMPLETED` or `FAILED`
+runs; it skips active, foreign, live, or corrupt entries. Use `--dry-run` before
+cleanup and `--yes` only in trusted automation.
 
 ## Limits and conformance
 

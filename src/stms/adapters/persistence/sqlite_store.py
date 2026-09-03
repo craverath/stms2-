@@ -2,17 +2,95 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 from typing import Iterator
 
-from stms.domain.errors import CompatibilityError, LockError
+from stms.domain.errors import CompatibilityError, InfrastructureError, LockError
 from stms.domain.models import ExternalOperation, OperationStatus, RunState, WorkflowSnapshot
 
 ACTIVE_STATES = {state.value for state in RunState if state not in {RunState.COMPLETED, RunState.FAILED}}
+
+
+@dataclass(frozen=True)
+class SecureDatabaseIdentity:
+    """Stable identities for a database and every path component below a root."""
+
+    root: str
+    database: tuple[int, int]
+    components: tuple[tuple[str, int, int], ...]
+
+
+def capture_database_identity(database_path: Path, secure_root: Path) -> SecureDatabaseIdentity:
+    """Capture a regular database and non-symlink directory chain without following links."""
+    root = secure_root.resolve()
+    database = database_path.absolute()
+    try:
+        relative = database.relative_to(root)
+    except ValueError as error:
+        raise InfrastructureError(
+            "Administrative database escapes the repository.",
+            "Use a database located below the repository root.",
+        ) from error
+    try:
+        root_metadata = os.lstat(root)
+    except OSError as error:
+        raise InfrastructureError(
+            f"Administrative root is unavailable: {root}.",
+            "Restore the repository directory and retry.",
+        ) from error
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise InfrastructureError(
+            f"Administrative root is unsafe: {root}.",
+            "Use a regular repository directory.",
+        )
+    components: list[tuple[str, int, int]] = [(str(root), root_metadata.st_dev, root_metadata.st_ino)]
+    current = root
+    for part in relative.parts[:-1]:
+        current = current / part
+        try:
+            metadata = os.lstat(current)
+        except OSError as error:
+            raise InfrastructureError(
+                f"Administrative database parent is unavailable: {current}.",
+                "Restore a regular repository directory and retry.",
+            ) from error
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise InfrastructureError(
+                f"Administrative database parent is unsafe: {current}.",
+                "Replace symlinks or non-directory components with regular repository directories.",
+            )
+        components.append((str(current), metadata.st_dev, metadata.st_ino))
+    try:
+        metadata = os.lstat(database)
+    except OSError as error:
+        raise InfrastructureError(
+            f"Administrative database is unavailable: {database}.",
+            "Restore the run database and retry.",
+        ) from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise InfrastructureError(
+            f"Administrative database is unsafe: {database}.",
+            "Use a regular SQLite file, not a symlink or special file.",
+        )
+    return SecureDatabaseIdentity(str(root), (metadata.st_dev, metadata.st_ino), tuple(components))
+
+
+def readonly_sqlite_uri(database: Path) -> str:
+    """See a live WAL when present, otherwise avoid creating SQLite sidecars."""
+    wal = database.with_name(database.name + "-wal")
+    if wal.is_symlink():
+        raise InfrastructureError(
+            f"SQLite WAL is unsafe: {wal}.",
+            "Replace the symlink with the run's regular WAL file and retry.",
+        )
+    parameters = "mode=ro" if wal.exists() else "mode=ro&immutable=1"
+    return database.resolve().as_uri() + "?" + parameters
 
 
 def resumable_run_exists(repository: Path) -> bool:
@@ -27,12 +105,12 @@ def resumable_run_exists(repository: Path) -> bool:
         return False
     for database in root.glob("*/checkpoint.sqlite"):
         try:
-            connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+            connection = sqlite3.connect(readonly_sqlite_uri(database), uri=True)
             row = connection.execute("SELECT state FROM snapshots ORDER BY sequence DESC LIMIT 1").fetchone()
             connection.close()
             if row and row[0] in ACTIVE_STATES:
                 return True
-        except sqlite3.Error:
+        except (InfrastructureError, sqlite3.Error):
             # A malformed partial run is not safe to overwrite; treat it as an
             # active run and direct the user to inspect/resume it.
             return True
@@ -40,19 +118,38 @@ def resumable_run_exists(repository: Path) -> bool:
 
 
 class SQLiteCheckpointStore:
-    def __init__(self, database_path: Path) -> None:
+    def __init__(self, database_path: Path, *, secure_identity: SecureDatabaseIdentity | None = None) -> None:
         self.database_path = database_path
-        database_path.parent.mkdir(parents=True, exist_ok=True)
+        self._secure_identity = secure_identity
+        if secure_identity is None:
+            database_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            self._verify_secure_identity()
         self._initialize()
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
+        self._verify_secure_identity()
         connection = sqlite3.connect(self.database_path, timeout=5, isolation_level=None)
         connection.row_factory = sqlite3.Row
         try:
+            # Revalidate after SQLite has opened the file and before yielding a
+            # connection to any statement that can write.
+            self._verify_secure_identity()
             yield connection
         finally:
             connection.close()
+
+    def _verify_secure_identity(self) -> None:
+        expected = self._secure_identity
+        if expected is None:
+            return
+        current = capture_database_identity(self.database_path, Path(expected.root))
+        if current != expected:
+            raise InfrastructureError(
+                "Administrative database path changed during the operation.",
+                "Stop concurrent filesystem changes, restore the original regular database, and retry.",
+            )
 
     def _initialize(self) -> None:
         with self._connection() as connection:
@@ -116,6 +213,32 @@ class SQLiteCheckpointStore:
                     raise LockError(f"Repository already has active run {existing['run_id']}.", "Resume or finish that run before starting another one.")
                 connection.execute("DELETE FROM repository_locks WHERE repository=?", (repository_key,))
             connection.execute("INSERT INTO repository_locks(repository, run_id, pid, acquired_at) VALUES (?, ?, ?, ?) ON CONFLICT(repository) DO UPDATE SET run_id=excluded.run_id, pid=excluded.pid, acquired_at=excluded.acquired_at", (repository_key, run_id, pid, _now()))
+            connection.execute("COMMIT")
+
+    def acquire_administrative_lock(self, repository: Path, owner: str, pid: int | None = None) -> None:
+        """Atomically exclude workflow and administrative writers.
+
+        Unlike normal resume locking, administration must not take ownership
+        from the target run itself while its process is still alive.
+        """
+        repository_key = str(repository.resolve()); pid = pid or os.getpid()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT run_id, pid FROM repository_locks WHERE repository=?", (repository_key,)
+            ).fetchone()
+            if existing and _pid_alive(existing["pid"]):
+                connection.execute("ROLLBACK")
+                raise LockError(
+                    f"Repository is in use by {existing['run_id']} (process {existing['pid']}).",
+                    "Wait for that process to exit before running the administrative command.",
+                )
+            if existing:
+                connection.execute("DELETE FROM repository_locks WHERE repository=?", (repository_key,))
+            connection.execute(
+                "INSERT INTO repository_locks(repository, run_id, pid, acquired_at) VALUES (?, ?, ?, ?)",
+                (repository_key, owner, pid, _now()),
+            )
             connection.execute("COMMIT")
 
     def release_lock(self, repository: Path, run_id: str) -> None:

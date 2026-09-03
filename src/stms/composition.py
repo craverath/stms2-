@@ -8,6 +8,7 @@ from stms.adapters.harnesses.codex import CodexHarness
 from stms.adapters.harnesses.pi import PiHarness
 from stms.adapters.sandbox.srt import SrtSandboxRuntime
 from stms.application.orchestrator import Orchestrator
+from stms.application.preflight import PreflightService
 from stms.domain.ports import EventRenderer, EventSink
 
 
@@ -20,4 +21,14 @@ def compose(repository: Path, *, event_sink: EventSink | None = None, event_rend
         sandbox=sandbox,
         event_sink=event_sink,
         event_renderer=event_renderer,
+    )
+
+
+def compose_preflight(repository: Path) -> PreflightService:
+    """Build the same production prerequisites for read-only diagnosis."""
+    sandbox = SrtSandboxRuntime()
+    return PreflightService(
+        repository,
+        {"codex": CodexHarness(), "claude": ClaudeHarness(), "pi": PiHarness(sandbox=sandbox)},
+        sandbox,
     )

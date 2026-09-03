@@ -8,14 +8,185 @@ import subprocess
 
 import typer
 
-from stms.application.configuration import configuration_example
-from stms.composition import compose
+import stms
+from stms.application.configuration import configuration_example, load_runtime_config
+from stms.application.run_admin import (
+    RunCommandError,
+    abort_run,
+    clean_runs,
+    find_run,
+    inspect_runs,
+    next_action,
+    read_logs,
+)
+from stms.composition import compose, compose_preflight
 from stms.application.orchestrator import Orchestrator, RunContext
 from stms.domain.errors import ConfigurationError, InfrastructureError, StmsError
 from stms.domain.models import RunState
 from stms.terminal import Terminal
 
 app = typer.Typer(help="STMS local development workflow orchestrator.", no_args_is_help=True)
+config_app = typer.Typer(help="Validate and inspect project configuration.")
+app.add_typer(config_app, name="config")
+
+
+@app.callback(invoke_without_command=True)
+def main(
+    version: bool = typer.Option(False, "--version", is_eager=True, help="Show the installed STMS version."),
+) -> None:
+    if version:
+        typer.echo(f"stms {stms.__version__}")
+        raise typer.Exit()
+
+
+@app.command()
+def doctor() -> None:
+    """Probe readiness without running project tests or starting agents."""
+    result = compose_preflight(Path.cwd()).diagnose()
+    for item in result.diagnostics:
+        typer.echo(f"[{item.status}] {item.name}: {item.detail}")
+    if not result.ready:
+        raise typer.Exit(code=2)
+
+
+@config_app.command("validate")
+def validate_config() -> None:
+    """Validate ./stms.yml and print its deterministic digest."""
+    try:
+        config = load_runtime_config(Path.cwd())
+    except ConfigurationError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=2) from error
+    typer.echo(f"stms.yml is valid; digest {config.digest()}")
+
+
+@app.command()
+def runs() -> None:
+    """List persisted runs, newest checkpoint first."""
+    records, issues = inspect_runs(Path.cwd())
+    if not records and not issues:
+        typer.echo("No STMS runs found.")
+        return
+    for record in records:
+        snapshot = record.snapshot
+        typer.echo(
+            f"{record.run_id} state={snapshot.state.value} phase={snapshot.phase.value} "
+            f"checkpoint={record.sequence}@{record.checkpoint_at} progress={record.progress}"
+        )
+    for issue in issues:
+        typer.echo(f"CORRUPT {issue.run_id}: {issue.message}", err=True)
+    if issues:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def status(run_id: str | None = typer.Argument(None, help="Run ID; newest checkpoint is the default.")) -> None:
+    """Show the latest SQLite checkpoint for one run."""
+    try:
+        record = find_run(Path.cwd(), run_id)
+    except RunCommandError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=error.exit_code) from error
+    snapshot = record.snapshot
+    typer.echo(f"run: {record.run_id}")
+    typer.echo(f"state: {snapshot.state.value}")
+    typer.echo(f"phase: {snapshot.phase.value}")
+    typer.echo(f"subphase: {snapshot.subphase.value}")
+    typer.echo(f"checkpoint: {record.sequence} at {record.checkpoint_at}")
+    typer.echo(f"last transition: {snapshot.last_transition or '-'}")
+    typer.echo(f"pause: {snapshot.pause_reason or '-'}")
+    typer.echo(f"resume state: {snapshot.resume_state.value if snapshot.resume_state else '-'}")
+    typer.echo(f"pending operations: {', '.join(record.pending_operations) or 'none'}")
+    typer.echo(f"progress: {record.progress}")
+    typer.echo(f"next action: {next_action(snapshot)}")
+
+
+@app.command()
+def logs(run_id: str = typer.Argument(..., help="Run ID.")) -> None:
+    """Print events and test logs in deterministic order."""
+    try:
+        sections = read_logs(Path.cwd(), run_id)
+    except RunCommandError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=error.exit_code) from error
+    if not sections:
+        typer.echo(f"No logs found for run {run_id}.")
+        return
+    for name, content in sections:
+        typer.echo(f"== {name} ==")
+        typer.echo(content, nl=not content.endswith("\n"))
+
+
+@app.command()
+def abort(
+    run_id: str = typer.Argument(..., help="Run ID."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    """Mark an inactive run FAILED while preserving all artifacts."""
+    try:
+        existing = find_run(Path.cwd(), run_id)
+    except RunCommandError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=error.exit_code) from error
+    if existing.snapshot.state == RunState.FAILED:
+        try:
+            snapshot, _ = abort_run(Path.cwd(), run_id)
+        except RunCommandError as error:
+            typer.echo(str(error), err=True)
+            raise typer.Exit(code=error.exit_code) from error
+        typer.echo(f"Run {run_id} is already {snapshot.state.value}.")
+        return
+    if existing.snapshot.state == RunState.COMPLETED:
+        typer.echo(f"Run {run_id!r} is COMPLETED and cannot be aborted.", err=True)
+        raise typer.Exit(code=2)
+    if not yes and not typer.confirm(f"Abort run {run_id}? Artifacts will be preserved"):
+        typer.echo("Abort cancelled.")
+        raise typer.Exit(code=1)
+    try:
+        snapshot, changed = abort_run(Path.cwd(), run_id)
+    except RunCommandError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=error.exit_code) from error
+    typer.echo(f"Run {run_id} {'aborted' if changed else 'is already'} {snapshot.state.value}.")
+
+
+@app.command()
+def clean(
+    dry_run: bool = typer.Option(False, "--dry-run", help="List eligible runs without removing them."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    """Remove repository-owned terminal run artifact directories."""
+    preview = clean_runs(Path.cwd(), dry_run=True)
+    for record in preview.candidates:
+        typer.echo(f"{'Would remove' if dry_run else 'Eligible'}: {record.run_id} ({record.snapshot.state.value})")
+    for message in preview.ignored:
+        typer.echo(f"Ignored: {message}")
+    if dry_run or not preview.candidates:
+        if preview.errors:
+            raise typer.Exit(code=1)
+        return
+    if not yes and not typer.confirm(f"Remove {len(preview.candidates)} terminal run director{'y' if len(preview.candidates) == 1 else 'ies'}"):
+        typer.echo("Clean cancelled.")
+        raise typer.Exit(code=1)
+    try:
+        result = clean_runs(
+            Path.cwd(),
+            dry_run=False,
+            only_run_ids=frozenset(record.run_id for record in preview.candidates),
+        )
+    except RunCommandError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=error.exit_code) from error
+    for run in result.removed:
+        typer.echo(f"Removed: {run}")
+    for message in result.ignored:
+        if message not in preview.ignored:
+            typer.echo(f"Ignored: {message}")
+    if result.errors:
+        for message in result.errors:
+            if message not in preview.errors:
+                typer.echo(f"Error: {message}", err=True)
+        raise typer.Exit(code=1)
 
 
 @app.command()

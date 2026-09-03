@@ -34,7 +34,11 @@ def load_runtime_config(repository: Path) -> RuntimeConfig:
     if not config_path.is_file():
         raise ConfigurationError("Missing required stms.yml.", f"Run 'stms init', or create it using this example:\n{configuration_example()}")
     try:
-        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        config_text = config_path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as error:
+        raise ConfigurationError("Could not read UTF-8 stms.yml.", "Fix the file encoding or permissions and run again.") from error
+    try:
+        payload = yaml.safe_load(config_text)
     except yaml.YAMLError as error:
         raise ConfigurationError("Invalid YAML in stms.yml.", "Fix the YAML syntax and run again.") from error
     if not isinstance(payload, dict):
